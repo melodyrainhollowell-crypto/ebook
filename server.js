@@ -623,21 +623,68 @@ async function zuckPayApi(path, { method = 'GET', body } = {}) {
   return res;
 }
 
-function sendZuckPayCheckoutPage(res, payload) {
+function buildZuckPayCheckoutContext(req, resolved) {
+  const { amount, success_url, product_name, display_title } = resolved;
+  const amountNumber = Number(amount);
+  const maskedForProcessor = product_name ? String(product_name).trim() : 'Digital Ebook';
+  const realForBuyer = display_title ? String(display_title).trim() : '';
+  const origin = `${req.protocol}://${req.get('host')}`;
+  const extra = {
+    display_title: realForBuyer,
+    video_id: req.query.video_id ? String(req.query.video_id) : '',
+    telegram_username: req.query.telegram_username ? String(req.query.telegram_username) : '',
+  };
+  const fromStoreSuccess = sameOriginUrl(success_url, origin);
+  const forwardSuccess = fromStoreSuccess
+    ? fromStoreSuccess
+    : getEbooksReturnUrl(origin, 'success', maskedForProcessor, amountNumber.toFixed(2), {
+        ...extra,
+        display_title: realForBuyer || maskedForProcessor,
+      });
+  const successIntermediate = `${origin}/api/zuckpay-success?forward=${encodeURIComponent(forwardSuccess)}`;
+  const cancel_url = buildCheckoutSelfCancelUrl(req, { ...resolved, method: 'zuckpay' });
+  const webhookUrl = `${origin}/api/zuckpay-webhook`;
+  const currencyRaw = String(resolved.currency || 'USD').toUpperCase();
+  const currencyCode = /^[A-Z]{3}$/.test(currencyRaw) ? currencyRaw : 'USD';
+  const externalId = ['EBK', extra.video_id || 'item', Date.now().toString(36)].join('-').slice(0, 120);
+  const showPrivacyBlurb =
+    Boolean(display_title && String(display_title).trim()) &&
+    String(realForBuyer).trim() !== String(maskedForProcessor).trim();
+
+  return {
+    amountNumber,
+    maskedForProcessor,
+    realForBuyer,
+    forwardSuccess,
+    successIntermediate,
+    cancel_url,
+    webhookUrl,
+    currencyCode,
+    externalId,
+    showPrivacyBlurb,
+    success_url: String(success_url),
+    extra,
+  };
+}
+
+function sendZuckPayCardCheckoutPage(res, payload) {
   const {
-    approvalUrl,
+    stripePublishableKey,
     realTitle,
     maskedLabel,
     amountStr,
     currencyCode,
     showPrivacyBlurb,
     paymentCanceled,
+    cancelUrl,
+    chargeContext,
   } = payload;
   const htmlReal = escapeHtml(realTitle);
   const htmlMasked = escapeHtml(maskedLabel);
   const htmlAmount = escapeHtml(amountStr);
   const htmlCur = escapeHtml(currencyCode);
-  const safeApprovalUrl = escapeForJs(approvalUrl);
+  const safeCancel = escapeForJs(cancelUrl);
+  const ctxJson = JSON.stringify(chargeContext);
   const cancelBanner = paymentCanceled
     ? `<p class="cancel-banner" role="status">Payment cancelled. No charges were made — you can try again below.</p>`
     : '';
@@ -648,7 +695,8 @@ function sendZuckPayCheckoutPage(res, payload) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
-  <title>${escapeHtml(`${SITE_NAME} · Continue`)}</title>
+  <title>${escapeHtml(`${SITE_NAME} · Checkout`)}</title>
+  <script src="https://js.stripe.com/v3/"></script>
   <style>
     :root { --bg-deep: #020617; --paper: rgba(2, 8, 36, 0.94); --primary: #ff3366; --accent: #00e5ff; --text: #e8e8e8; --muted: rgba(148, 163, 184, 0.92); }
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -683,15 +731,27 @@ function sendZuckPayCheckoutPage(res, payload) {
       display: block; font-size: .65rem; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin-bottom: .35rem;
     }
     .amount { font-size: 1.95rem; font-weight: 800; color: var(--primary); margin-bottom: 1rem; letter-spacing: -.04em; }
+    .field { margin-bottom: .75rem; }
+    .field label { display: block; font-size: .68rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: .35rem; }
+    .field input {
+      width: 100%; padding: .72rem .8rem; border-radius: 10px; border: 1px solid rgba(129,140,248,.28);
+      background: rgba(255,255,255,.04); color: var(--text); font: inherit;
+    }
+    #card-element {
+      padding: .78rem .8rem; border-radius: 10px; border: 1px solid rgba(129,140,248,.28);
+      background: rgba(255,255,255,.04);
+    }
+    #card-errors { font-size: .74rem; color: #fca5a5; min-height: 1.1rem; margin-top: .45rem; }
     .btn {
       display: block; width: 100%; text-align: center;
-      font-weight: 800; padding: .85rem 1rem; border-radius: 14px;
+      font-weight: 800; padding: .85rem 1rem; border-radius: 14px; margin-top: .85rem;
       background: linear-gradient(120deg, #6c54ff 0%, #0096d9 52%, #00c9c8);
       color: #fff; border: none; cursor: pointer; font-family: inherit; font-size: .92rem;
       box-shadow: 0 14px 40px rgba(108, 84, 255, .28);
-      text-decoration: none;
     }
+    .btn:disabled { opacity: .55; cursor: not-allowed; }
     .fine { font-size: .66rem; color: var(--muted); text-align: center; margin-top: .7rem; line-height: 1.48; }
+    .back { display: block; text-align: center; margin-top: .55rem; font-size: .72rem; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -699,7 +759,7 @@ function sendZuckPayCheckoutPage(res, payload) {
     <article class="card">
       <div class="card-accent" aria-hidden="true"></div>
       <div class="card-body">
-        <p class="eyebrow">Secure checkout</p>
+        <p class="eyebrow">Secure checkout · Card (USD)</p>
         <h1 class="brand">${escapeHtml(SITE_NAME)}</h1>
         <div class="divider"></div>
         ${cancelBanner}
@@ -717,21 +777,91 @@ function sendZuckPayCheckoutPage(res, payload) {
         </div>`
         }
         <p class="amount">$${htmlAmount} <small style="font-size:.76rem;color:var(--muted);font-weight:700">${htmlCur}</small></p>
-        <a class="btn" id="btn-zuckpay" href="${escapeHtml(approvalUrl)}">Continue to secure payment</a>
-        <p class="fine">You will complete payment on PayPal (USD). After payment you return here, then to the store.</p>
+        <form id="zp-form" novalidate>
+          <div class="field">
+            <label for="zp-name">Name on card</label>
+            <input id="zp-name" name="name" type="text" autocomplete="name" required>
+          </div>
+          <div class="field">
+            <label for="zp-email">Email</label>
+            <input id="zp-email" name="email" type="email" autocomplete="email" required>
+          </div>
+          <div class="field">
+            <label>Card details</label>
+            <div id="card-element"></div>
+            <div id="card-errors" role="alert"></div>
+          </div>
+          <button type="submit" class="btn" id="zp-submit">Pay securely</button>
+        </form>
+        <p class="fine">Encrypted card payment in USD. After paying you return to the store.</p>
+        <a class="back" href="${escapeHtml(cancelUrl)}">Cancel and go back</a>
       </div>
     </article>
   </div>
   <script>
     (function () {
-      var APPROVAL_URL = '${safeApprovalUrl}';
-      var btn = document.getElementById('btn-zuckpay');
-      if (btn) btn.addEventListener('click', function (e) {
-        e.preventDefault();
-        window.location.href = APPROVAL_URL;
+      var CTX = ${ctxJson};
+      var CANCEL_URL = '${safeCancel}';
+      var stripe = Stripe(${JSON.stringify(stripePublishableKey)});
+      var elements = stripe.elements();
+      var card = elements.create('card', {
+        style: {
+          base: { color: '#e8e8e8', fontFamily: 'system-ui, sans-serif', fontSize: '16px', '::placeholder': { color: '#94a3b8' } },
+          invalid: { color: '#fca5a5' }
+        }
       });
-      window.addEventListener('load', function () {
-        setTimeout(function () { window.location.href = APPROVAL_URL; }, 350);
+      card.mount('#card-element');
+      card.on('change', function (e) {
+        document.getElementById('card-errors').textContent = e.error ? e.error.message : '';
+      });
+
+      var form = document.getElementById('zp-form');
+      var submitBtn = document.getElementById('zp-submit');
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        var nome = String(document.getElementById('zp-name').value || '').trim();
+        var email = String(document.getElementById('zp-email').value || '').trim();
+        if (!nome || !email) {
+          document.getElementById('card-errors').textContent = 'Enter your name and email.';
+          return;
+        }
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Processing…';
+        stripe.createPaymentMethod({
+          type: 'card',
+          card: card,
+          billing_details: { name: nome, email: email }
+        }).then(function (result) {
+          if (result.error) {
+            document.getElementById('card-errors').textContent = result.error.message || 'Card error';
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Pay securely';
+            return;
+          }
+          return fetch('/api/zuckpay-charge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify(Object.assign({}, CTX, {
+              payment_method: result.paymentMethod.id,
+              nome: nome,
+              email: email
+            }))
+          });
+        }).then(function (res) {
+          if (!res) return;
+          return res.json().then(function (data) {
+            if (!res.ok) throw new Error(data.error || 'Payment failed');
+            if (data.redirect) {
+              window.location.replace(data.redirect);
+              return;
+            }
+            throw new Error('Unexpected payment response');
+          });
+        }).catch(function (err) {
+          document.getElementById('card-errors').textContent = err.message || 'Payment could not be completed.';
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Pay securely';
+        });
       });
     })();
   </script>
@@ -741,7 +871,7 @@ function sendZuckPayCheckoutPage(res, payload) {
 
 async function handleZuckPayCheckout(req, res) {
   const resolved = resolveCheckoutParams(req);
-  const { amount, success_url, product_name, display_title, paymentCanceled } = resolved;
+  const { amount, success_url, paymentCanceled } = resolved;
   if (!amount || !success_url) {
     const missing = [!amount && 'amount', !success_url && 'success_url'].filter(Boolean).join(', ');
     return res.status(400).send(`Missing required parameters (${missing}). Open checkout from the video store again.`);
@@ -754,88 +884,117 @@ async function handleZuckPayCheckout(req, res) {
     );
   }
 
-  const amountNumber = Number(amount);
-  if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+  const ctx = buildZuckPayCheckoutContext(req, resolved);
+  if (!Number.isFinite(ctx.amountNumber) || ctx.amountNumber <= 0) {
     return res.status(400).send('Invalid amount');
   }
 
   applyCommonHeaders(res);
 
-  const maskedForProcessor = product_name ? String(product_name).trim() : 'Digital Ebook';
-  const realForBuyer = display_title ? String(display_title).trim() : '';
-  const origin = `${req.protocol}://${req.get('host')}`;
-  const extra = {
-    display_title: realForBuyer,
-    video_id: req.query.video_id ? String(req.query.video_id) : '',
-    telegram_username: req.query.telegram_username ? String(req.query.telegram_username) : '',
-  };
-  const fromStoreSuccess = sameOriginUrl(success_url, origin);
-  const forwardSuccess = fromStoreSuccess
-    ? fromStoreSuccess
-    : getEbooksReturnUrl(origin, 'success', maskedForProcessor, amountNumber.toFixed(2), {
-        ...extra,
-        display_title: realForBuyer || maskedForProcessor,
-      });
-  const successIntermediate = `${origin}/api/zuckpay-success?forward=${encodeURIComponent(forwardSuccess)}`;
-  const cancel_url = buildCheckoutSelfCancelUrl(req, { ...resolved, method: 'zuckpay' });
-  const webhookUrl = `${origin}/api/zuckpay-webhook`;
-
-  const currencyRaw = String(resolved.currency || 'USD').toUpperCase();
-  const currencyCode = /^[A-Z]{3}$/.test(currencyRaw) ? currencyRaw : 'USD';
-
-  const externalId = [
-    'EBK',
-    extra.video_id || 'item',
-    Date.now().toString(36),
-  ]
-    .join('-')
-    .slice(0, 120);
-
-  const checkoutEmail = String(process.env.ZUCKPAY_CHECKOUT_EMAIL || 'checkout@customer.local').trim();
-
-  const createPayload = {
-    nome: 'Customer',
-    email: checkoutEmail,
-    valor: amountNumber,
-    currency: currencyCode,
-    descricao: maskedForProcessor.slice(0, 127),
-    urlnoty: webhookUrl,
-    return_url: successIntermediate,
-    cancel_url,
-    external_id_client: externalId,
-  };
-
-  const createRes = await zuckPayApi('/paypal/order', { method: 'POST', body: createPayload });
-  const createData = await createRes.json().catch(() => ({}));
-  if (!createRes.ok) {
-    const msg =
-      createData?.message ||
-      createData?.error ||
-      JSON.stringify(createData).slice(0, 400);
-    console.error('ZuckPay order create failed:', createRes.status, msg);
+  const keysRes = await zuckPayApi('/card/keys');
+  const keysData = await keysRes.json().catch(() => ({}));
+  if (!keysRes.ok) {
+    const msg = keysData?.message || keysData?.error || JSON.stringify(keysData).slice(0, 400);
+    console.error('ZuckPay card keys failed:', keysRes.status, msg);
     return res
-      .status(createRes.status >= 400 && createRes.status < 600 ? createRes.status : 502)
+      .status(keysRes.status >= 400 && keysRes.status < 600 ? keysRes.status : 502)
       .send(`Checkout failed (ZuckPay): ${msg}`);
   }
 
-  const approvalUrl = createData?.approvalUrl ? String(createData.approvalUrl) : '';
-  if (!approvalUrl) {
-    return res.status(502).send('Checkout failed (ZuckPay): missing approval URL');
+  const stripePublishableKey = String(keysData?.publishableKey || '').trim();
+  const stripeIntl = keysData?.stripe?.enabled && keysData?.stripe?.mode === 'international';
+  if (!stripePublishableKey || !stripeIntl) {
+    return res.status(502).send(
+      'Checkout failed (ZuckPay): international card (USD) is not enabled on your ZuckPay account.'
+    );
   }
 
-  const showPrivacyBlurb =
-    Boolean(display_title && String(display_title).trim()) &&
-    String(realForBuyer).trim() !== String(maskedForProcessor).trim();
-
-  return sendZuckPayCheckoutPage(res, {
-    approvalUrl,
-    realTitle: realForBuyer || maskedForProcessor,
-    maskedLabel: maskedForProcessor,
-    amountStr: amountNumber.toFixed(2),
-    currencyCode,
-    showPrivacyBlurb,
+  return sendZuckPayCardCheckoutPage(res, {
+    stripePublishableKey,
+    realTitle: ctx.realForBuyer || ctx.maskedForProcessor,
+    maskedLabel: ctx.maskedForProcessor,
+    amountStr: ctx.amountNumber.toFixed(2),
+    currencyCode: ctx.currencyCode,
+    showPrivacyBlurb: ctx.showPrivacyBlurb,
     paymentCanceled,
+    cancelUrl: ctx.cancel_url,
+    chargeContext: {
+      amount: ctx.amountNumber,
+      currency: ctx.currencyCode,
+      success_url: ctx.success_url,
+      product_name: ctx.maskedForProcessor,
+      video_id: ctx.extra.video_id,
+      telegram_username: ctx.extra.telegram_username,
+      external_id_client: ctx.externalId,
+    },
   });
+}
+
+async function handleZuckPayCharge(req, res) {
+  const b = req.body || {};
+  const payment_method = String(b.payment_method || '').trim();
+  const nome = String(b.nome || '').trim();
+  const email = String(b.email || '').trim();
+  const amount = Number(b.amount);
+  const currencyCode = /^[A-Z]{3}$/.test(String(b.currency || 'USD').toUpperCase())
+    ? String(b.currency || 'USD').toUpperCase()
+    : 'USD';
+  const success_url = String(b.success_url || '').trim();
+  const product_name = String(b.product_name || 'Digital Ebook').trim();
+  const video_id = b.video_id ? String(b.video_id) : '';
+  const telegram_username = b.telegram_username ? String(b.telegram_username) : '';
+  const external_id_client = String(b.external_id_client || `EBK-${Date.now().toString(36)}`).slice(0, 120);
+
+  if (!payment_method.startsWith('pm_') || !nome || !email || !Number.isFinite(amount) || amount <= 0 || !success_url) {
+    return res.status(400).json({ error: 'Missing required payment fields' });
+  }
+
+  const { clientId, clientSecret } = getZuckPayCredentials();
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ error: 'ZuckPay is not configured' });
+  }
+
+  const origin = `${req.protocol}://${req.get('host')}`;
+  const extra = { video_id, telegram_username };
+  const fromStoreSuccess = sameOriginUrl(success_url, origin);
+  const forwardSuccess = fromStoreSuccess
+    ? fromStoreSuccess
+    : getEbooksReturnUrl(origin, 'success', product_name, amount.toFixed(2), extra);
+  const successIntermediate = `${origin}/api/zuckpay-success?forward=${encodeURIComponent(forwardSuccess)}`;
+  const webhookUrl = `${origin}/api/zuckpay-webhook`;
+
+  const chargePayload = {
+    nome,
+    email,
+    valor: amount,
+    currency: currencyCode,
+    payment_method,
+    urlnoty: webhookUrl,
+    return_url: successIntermediate,
+    external_id_client,
+  };
+
+  const chargeRes = await zuckPayApi('/card/charge', { method: 'POST', body: chargePayload });
+  const chargeData = await chargeRes.json().catch(() => ({}));
+  if (!chargeRes.ok) {
+    const msg = chargeData?.message || chargeData?.failureMessage || chargeData?.error || 'Charge failed';
+    console.error('ZuckPay card charge failed:', chargeRes.status, msg);
+    return res.status(chargeRes.status >= 400 && chargeRes.status < 600 ? chargeRes.status : 402).json({ error: msg });
+  }
+
+  if (chargeData.isPaid || chargeData.status === 'PAID') {
+    const tid = String(chargeData.transactionId || '');
+    const sep = forwardSuccess.includes('?') ? '&' : '?';
+    const redirect = tid ? `${forwardSuccess}${sep}order_id=${encodeURIComponent(tid)}` : forwardSuccess;
+    return res.json({ success: true, redirect });
+  }
+
+  if (chargeData.status === 'PENDING_3DS' && chargeData.threeDSecureUrl) {
+    return res.json({ success: true, redirect: String(chargeData.threeDSecureUrl) });
+  }
+
+  const decline = chargeData?.failureMessage || chargeData?.message || 'Payment declined';
+  return res.status(402).json({ error: decline });
 }
 
 async function handleWhopCheckout(req, res) {
@@ -1256,7 +1415,7 @@ function handlePayPalCheckout(req, res) {
 }
 
 // Dispatcher:
-// - method=zuckpay -> ZuckPay PayPal order (USD, masked description) + redirect to PayPal
+// - method=zuckpay -> ZuckPay international card (USD, Stripe) on this host
 // - method=whop -> Whop checkout configuration (masked product/plan) + redirect to whop.com
 // - method=paypal -> masked PayPal flow (on this host)
 // - method=paddle (or legacy payjsr) -> Paddle Billing: API transaction + Paddle.js overlay on this host
@@ -1286,6 +1445,15 @@ app.get('/api/zuckpay-checkout', async (req, res) => {
   } catch (err) {
     console.error('ZuckPay checkout error:', err);
     return res.status(500).send('Checkout failed');
+  }
+});
+
+app.post('/api/zuckpay-charge', async (req, res) => {
+  try {
+    return await handleZuckPayCharge(req, res);
+  } catch (err) {
+    console.error('ZuckPay charge error:', err);
+    return res.status(500).json({ error: 'Payment failed' });
   }
 });
 
@@ -1416,38 +1584,19 @@ app.get('/api/whop-success', (req, res) => {
   }
 });
 
-app.get('/api/zuckpay-success', async (req, res) => {
+app.get('/api/zuckpay-success', (req, res) => {
   try {
     const forward = String(req.query.forward || '');
+    const paymentId = String(
+      req.query.transaction_id ||
+        req.query.transactionId ||
+        req.query.order_id ||
+        req.query.orderId ||
+        ''
+    );
     if (!forward) {
       return res.status(400).send('Missing forward URL');
     }
-
-    const orderId = String(
-      req.query.token || req.query.orderId || req.query.order_id || ''
-    ).trim();
-
-    let paymentId = orderId;
-    if (orderId) {
-      const { clientId, clientSecret } = getZuckPayCredentials();
-      if (clientId && clientSecret) {
-        const captureRes = await zuckPayApi('/paypal/capture', {
-          method: 'POST',
-          body: { orderId },
-        });
-        const captureData = await captureRes.json().catch(() => ({}));
-        if (!captureRes.ok) {
-          const msg =
-            captureData?.message ||
-            captureData?.error ||
-            JSON.stringify(captureData).slice(0, 400);
-          console.error('ZuckPay capture failed:', captureRes.status, msg);
-          return res.status(captureRes.status >= 400 && captureRes.status < 600 ? captureRes.status : 502).send(`Payment capture failed: ${msg}`);
-        }
-        paymentId = String(captureData?.orderId || captureData?.transactionId || orderId);
-      }
-    }
-
     return sendCheckoutForwardPage(res, forward, paymentId);
   } catch (err) {
     console.error('ZuckPay success forward error:', err);
