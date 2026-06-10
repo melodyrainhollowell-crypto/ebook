@@ -22,6 +22,7 @@ function isCheckoutQuery(q) {
     q.method === 'paddle' ||
     q.method === 'payjsr' ||
     q.method === 'whop' ||
+    q.method === 'zuckpay' ||
     (q.video_id && (q.product_name || q.display_title))
   );
 }
@@ -582,6 +583,248 @@ function sendWhopCheckoutPage(res, payload) {
 </html>`);
 }
 
+const ZUCKPAY_API_BASE = 'https://zuckpay.com.br/conta/v3';
+
+function getZuckPayCredentials() {
+  return {
+    clientId: String(process.env.ZUCKPAY_CLIENT_ID || '').trim(),
+    clientSecret: String(process.env.ZUCKPAY_CLIENT_SECRET || '').trim(),
+  };
+}
+
+function zuckPayAuthHeader() {
+  const { clientId, clientSecret } = getZuckPayCredentials();
+  return `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
+}
+
+async function zuckPayApi(path, { method = 'GET', body } = {}) {
+  const headers = {
+    Authorization: zuckPayAuthHeader(),
+    Accept: 'application/json',
+  };
+  const init = { method, headers };
+  if (body != null) {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(body);
+  }
+  return fetch(`${ZUCKPAY_API_BASE}${path}`, init);
+}
+
+function sendZuckPayCheckoutPage(res, payload) {
+  const {
+    approvalUrl,
+    realTitle,
+    maskedLabel,
+    amountStr,
+    currencyCode,
+    showPrivacyBlurb,
+    paymentCanceled,
+  } = payload;
+  const htmlReal = escapeHtml(realTitle);
+  const htmlMasked = escapeHtml(maskedLabel);
+  const htmlAmount = escapeHtml(amountStr);
+  const htmlCur = escapeHtml(currencyCode);
+  const safeApprovalUrl = escapeForJs(approvalUrl);
+  const cancelBanner = paymentCanceled
+    ? `<p class="cancel-banner" role="status">Payment cancelled. No charges were made — you can try again below.</p>`
+    : '';
+  applyCommonHeaders(res);
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>${escapeHtml(`${SITE_NAME} · Continue`)}</title>
+  <style>
+    :root { --bg-deep: #020617; --paper: rgba(2, 8, 36, 0.94); --primary: #ff3366; --accent: #00e5ff; --text: #e8e8e8; --muted: rgba(148, 163, 184, 0.92); }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { color-scheme: dark; }
+    body {
+      font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      padding: 28px 18px;
+      background: linear-gradient(180deg, #030925 0%, var(--bg-deep) 50%, #000 100%);
+      color: var(--text);
+    }
+    .wrap { width: 100%; max-width: 420px; }
+    .card { border-radius: 20px; background: var(--paper); border: 1px solid rgba(129, 140, 248, 0.22); box-shadow: 0 24px 64px rgba(0,0,0,.55); overflow: hidden; }
+    .card-accent { height: 4px; background: linear-gradient(90deg, var(--primary), var(--accent)); }
+    .card-body { padding: 1.55rem 1.45rem 1.35rem; }
+    .eyebrow { font-size: 0.68rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); margin-bottom: .35rem; }
+    .brand { font-size: 1.08rem; font-weight: 800; letter-spacing: -.03em; margin-bottom: .75rem; }
+    .divider { height: 1px; background: linear-gradient(90deg, transparent, rgba(129,140,248,.35), transparent); margin: .2rem 0 .85rem; }
+    .label { font-size: .62rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: .25rem; }
+    .real { font-size: .95rem; font-weight: 600; margin-bottom: .55rem; line-height: 1.42; }
+    .cancel-banner {
+      font-size: 0.82rem; line-height: 1.45; color: #fcd34d;
+      background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.28);
+      border-radius: 10px; padding: 0.65rem 0.75rem; margin-bottom: 0.85rem;
+    }
+    .privacy-callout {
+      font-size: .72rem; line-height: 1.52; color: var(--muted);
+      background: rgba(0, 229, 255, 0.06); border: 1px solid rgba(0, 229, 255, 0.2);
+      border-radius: 12px; padding: .7rem .85rem; margin-bottom: .9rem;
+    }
+    .privacy-callout strong {
+      display: block; font-size: .65rem; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin-bottom: .35rem;
+    }
+    .amount { font-size: 1.95rem; font-weight: 800; color: var(--primary); margin-bottom: 1rem; letter-spacing: -.04em; }
+    .btn {
+      display: block; width: 100%; text-align: center;
+      font-weight: 800; padding: .85rem 1rem; border-radius: 14px;
+      background: linear-gradient(120deg, #6c54ff 0%, #0096d9 52%, #00c9c8);
+      color: #fff; border: none; cursor: pointer; font-family: inherit; font-size: .92rem;
+      box-shadow: 0 14px 40px rgba(108, 84, 255, .28);
+      text-decoration: none;
+    }
+    .fine { font-size: .66rem; color: var(--muted); text-align: center; margin-top: .7rem; line-height: 1.48; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <article class="card">
+      <div class="card-accent" aria-hidden="true"></div>
+      <div class="card-body">
+        <p class="eyebrow">Secure checkout</p>
+        <h1 class="brand">${escapeHtml(SITE_NAME)}</h1>
+        <div class="divider"></div>
+        ${cancelBanner}
+        <p class="label">Your order</p>
+        <p class="real">${htmlReal}</p>
+        ${
+          showPrivacyBlurb
+            ? `<div class="privacy-callout" role="status">
+          <strong>Privacy</strong>
+          <span>Payment processor receives a neutral description (<span style="font-family:ui-monospace,monospace;color:#cbd5ff">${htmlMasked}</span>). Your receipt and bank statement avoid the title above.</span>
+        </div>`
+            : `<div class="privacy-callout" role="status">
+          <strong>Privacy</strong>
+          <span>A generic description is sent to the payment processor so your receipt and bank statement stay discreet.</span>
+        </div>`
+        }
+        <p class="amount">$${htmlAmount} <small style="font-size:.76rem;color:var(--muted);font-weight:700">${htmlCur}</small></p>
+        <a class="btn" id="btn-zuckpay" href="${escapeHtml(approvalUrl)}">Continue to secure payment</a>
+        <p class="fine">You will complete payment on PayPal (USD). After payment you return here, then to the store.</p>
+      </div>
+    </article>
+  </div>
+  <script>
+    (function () {
+      var APPROVAL_URL = '${safeApprovalUrl}';
+      var btn = document.getElementById('btn-zuckpay');
+      if (btn) btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        window.location.href = APPROVAL_URL;
+      });
+      window.addEventListener('load', function () {
+        setTimeout(function () { window.location.href = APPROVAL_URL; }, 350);
+      });
+    })();
+  </script>
+</body>
+</html>`);
+}
+
+async function handleZuckPayCheckout(req, res) {
+  const resolved = resolveCheckoutParams(req);
+  const { amount, success_url, product_name, display_title, paymentCanceled } = resolved;
+  if (!amount || !success_url) {
+    const missing = [!amount && 'amount', !success_url && 'success_url'].filter(Boolean).join(', ');
+    return res.status(400).send(`Missing required parameters (${missing}). Open checkout from the video store again.`);
+  }
+
+  const { clientId, clientSecret } = getZuckPayCredentials();
+  if (!clientId || !clientSecret) {
+    return res.status(500).send(
+      'ZuckPay is not configured. Set ZUCKPAY_CLIENT_ID and ZUCKPAY_CLIENT_SECRET in your environment.'
+    );
+  }
+
+  const amountNumber = Number(amount);
+  if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+    return res.status(400).send('Invalid amount');
+  }
+
+  applyCommonHeaders(res);
+
+  const maskedForProcessor = product_name ? String(product_name).trim() : 'Digital Ebook';
+  const realForBuyer = display_title ? String(display_title).trim() : '';
+  const origin = `${req.protocol}://${req.get('host')}`;
+  const extra = {
+    display_title: realForBuyer,
+    video_id: req.query.video_id ? String(req.query.video_id) : '',
+    telegram_username: req.query.telegram_username ? String(req.query.telegram_username) : '',
+  };
+  const fromStoreSuccess = sameOriginUrl(success_url, origin);
+  const forwardSuccess = fromStoreSuccess
+    ? fromStoreSuccess
+    : getEbooksReturnUrl(origin, 'success', maskedForProcessor, amountNumber.toFixed(2), {
+        ...extra,
+        display_title: realForBuyer || maskedForProcessor,
+      });
+  const successIntermediate = `${origin}/api/zuckpay-success?forward=${encodeURIComponent(forwardSuccess)}`;
+  const cancel_url = buildCheckoutSelfCancelUrl(req, { ...resolved, method: 'zuckpay' });
+  const webhookUrl = `${origin}/api/zuckpay-webhook`;
+
+  const currencyRaw = String(resolved.currency || 'USD').toUpperCase();
+  const currencyCode = /^[A-Z]{3}$/.test(currencyRaw) ? currencyRaw : 'USD';
+
+  const externalId = [
+    'EBK',
+    extra.video_id || 'item',
+    Date.now().toString(36),
+  ]
+    .join('-')
+    .slice(0, 120);
+
+  const checkoutEmail = String(process.env.ZUCKPAY_CHECKOUT_EMAIL || 'checkout@customer.local').trim();
+
+  const createPayload = {
+    nome: 'Customer',
+    email: checkoutEmail,
+    valor: amountNumber,
+    currency: currencyCode,
+    descricao: maskedForProcessor.slice(0, 127),
+    urlnoty: webhookUrl,
+    return_url: successIntermediate,
+    cancel_url,
+    external_id_client: externalId,
+  };
+
+  const createRes = await zuckPayApi('/paypal/order', { method: 'POST', body: createPayload });
+  const createData = await createRes.json().catch(() => ({}));
+  if (!createRes.ok) {
+    const msg =
+      createData?.message ||
+      createData?.error ||
+      JSON.stringify(createData).slice(0, 400);
+    console.error('ZuckPay order create failed:', createRes.status, msg);
+    return res
+      .status(createRes.status >= 400 && createRes.status < 600 ? createRes.status : 502)
+      .send(`Checkout failed (ZuckPay): ${msg}`);
+  }
+
+  const approvalUrl = createData?.approvalUrl ? String(createData.approvalUrl) : '';
+  if (!approvalUrl) {
+    return res.status(502).send('Checkout failed (ZuckPay): missing approval URL');
+  }
+
+  const showPrivacyBlurb =
+    Boolean(display_title && String(display_title).trim()) &&
+    String(realForBuyer).trim() !== String(maskedForProcessor).trim();
+
+  return sendZuckPayCheckoutPage(res, {
+    approvalUrl,
+    realTitle: realForBuyer || maskedForProcessor,
+    maskedLabel: maskedForProcessor,
+    amountStr: amountNumber.toFixed(2),
+    currencyCode,
+    showPrivacyBlurb,
+    paymentCanceled,
+  });
+}
+
 async function handleWhopCheckout(req, res) {
   const resolved = resolveCheckoutParams(req);
   const { amount, success_url, product_name, display_title } = resolved;
@@ -1000,13 +1243,17 @@ function handlePayPalCheckout(req, res) {
 }
 
 // Dispatcher:
+// - method=zuckpay -> ZuckPay PayPal order (USD, masked description) + redirect to PayPal
 // - method=whop -> Whop checkout configuration (masked product/plan) + redirect to whop.com
 // - method=paypal -> masked PayPal flow (on this host)
 // - method=paddle (or legacy payjsr) -> Paddle Billing: API transaction + Paddle.js overlay on this host
-// Default: whop
+// Default: paypal (zuckpay via method=zuckpay)
 app.get('/api/paypal-checkout', async (req, res) => {
   try {
-    const method = String(req.query.method || 'whop').toLowerCase();
+    const method = String(req.query.method || 'paypal').toLowerCase();
+    if (method === 'zuckpay') {
+      return await handleZuckPayCheckout(req, res);
+    }
     if (method === 'whop') {
       return await handleWhopCheckout(req, res);
     }
@@ -1016,6 +1263,15 @@ app.get('/api/paypal-checkout', async (req, res) => {
     return handlePayPalCheckout(req, res);
   } catch (err) {
     console.error('Checkout dispatch error:', err);
+    return res.status(500).send('Checkout failed');
+  }
+});
+
+app.get('/api/zuckpay-checkout', async (req, res) => {
+  try {
+    return await handleZuckPayCheckout(req, res);
+  } catch (err) {
+    console.error('ZuckPay checkout error:', err);
     return res.status(500).send('Checkout failed');
   }
 });
@@ -1147,11 +1403,66 @@ app.get('/api/whop-success', (req, res) => {
   }
 });
 
+app.get('/api/zuckpay-success', async (req, res) => {
+  try {
+    const forward = String(req.query.forward || '');
+    if (!forward) {
+      return res.status(400).send('Missing forward URL');
+    }
+
+    const orderId = String(
+      req.query.token || req.query.orderId || req.query.order_id || ''
+    ).trim();
+
+    let paymentId = orderId;
+    if (orderId) {
+      const { clientId, clientSecret } = getZuckPayCredentials();
+      if (clientId && clientSecret) {
+        const captureRes = await zuckPayApi('/paypal/capture', {
+          method: 'POST',
+          body: { orderId },
+        });
+        const captureData = await captureRes.json().catch(() => ({}));
+        if (!captureRes.ok) {
+          const msg =
+            captureData?.message ||
+            captureData?.error ||
+            JSON.stringify(captureData).slice(0, 400);
+          console.error('ZuckPay capture failed:', captureRes.status, msg);
+          return res.status(captureRes.status >= 400 && captureRes.status < 600 ? captureRes.status : 502).send(`Payment capture failed: ${msg}`);
+        }
+        paymentId = String(captureData?.orderId || captureData?.transactionId || orderId);
+      }
+    }
+
+    return sendCheckoutForwardPage(res, forward, paymentId);
+  } catch (err) {
+    console.error('ZuckPay success forward error:', err);
+    res.status(500).send('Forward failed');
+  }
+});
+
+app.post('/api/zuckpay-webhook', (req, res) => {
+  try {
+    const event = req.body?.event;
+    const txn = req.body?.transaction;
+    if (event && txn?.id) {
+      console.log('ZuckPay webhook:', event, txn.id, txn.status);
+    }
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('ZuckPay webhook error:', err);
+    res.sendStatus(200);
+  }
+});
+
 app.get('/api/health', (req, res) => {
   const whop = getWhopCredentials();
+  const zuck = getZuckPayCredentials();
   res.json({
     status: 'OK',
     site: SITE_NAME,
+    zuckpay_configured: Boolean(zuck.clientId && zuck.clientSecret),
     whop_configured: Boolean(whop.apiKey && whop.companyId),
     paddle_configured: Boolean(process.env.PADDLE_API_KEY && process.env.PADDLE_CLIENT_TOKEN),
     paypal_configured: Boolean(process.env.PAYPAL_CLIENT_ID),
