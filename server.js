@@ -583,7 +583,8 @@ function sendWhopCheckoutPage(res, payload) {
 </html>`);
 }
 
-const ZUCKPAY_API_BASE = 'https://zuckpay.com.br/conta/v3';
+/** Must use www — bare host 301-redirects and Node fetch turns POST into GET on redirect. */
+const ZUCKPAY_API_BASE = 'https://www.zuckpay.com.br/conta/v3';
 
 function getZuckPayCredentials() {
   return {
@@ -598,16 +599,28 @@ function zuckPayAuthHeader() {
 }
 
 async function zuckPayApi(path, { method = 'GET', body } = {}) {
+  const { clientId, clientSecret } = getZuckPayCredentials();
   const headers = {
     Authorization: zuckPayAuthHeader(),
     Accept: 'application/json',
   };
-  const init = { method, headers };
+  const init = { method, headers, redirect: 'manual' };
   if (body != null) {
     headers['Content-Type'] = 'application/json';
-    init.body = JSON.stringify(body);
+    init.body = JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      ...body,
+    });
   }
-  return fetch(`${ZUCKPAY_API_BASE}${path}`, init);
+  const res = await fetch(`${ZUCKPAY_API_BASE}${path}`, init);
+  if (res.status >= 300 && res.status < 400) {
+    const location = res.headers.get('location');
+    throw new Error(
+      `ZuckPay API redirected (${res.status})${location ? ` to ${location}` : ''}. Check ZUCKPAY_API_BASE.`
+    );
+  }
+  return res;
 }
 
 function sendZuckPayCheckoutPage(res, payload) {
